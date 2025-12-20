@@ -10,8 +10,10 @@ __global__ void selective_scan_fwd_kernel(
     const scalar_t* __restrict__ B,
     const scalar_t* __restrict__ C,
     const scalar_t* __restrict__ D,
+    const scalar_t* __restrict__ h0,
     scalar_t* __restrict__ out,
     scalar_t* __restrict__ x_state_save, 
+    scalar_t* __restrict__ ht,
     const int B_size, const int L_size, const int D_size, const int N_size
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -21,8 +23,13 @@ __global__ void selective_scan_fwd_kernel(
     int b_idx = idx / D_size;
     int d_idx = idx % D_size;
 
-    float state[16]; 
-    for (int n = 0; n < N_size; ++n) state[n] = 0.0f;
+    float state[64]; 
+    if (h0 != nullptr) {
+        const scalar_t* h0_ptr = h0 + (b_idx * D_size * N_size) + (d_idx * N_size);
+        for (int n = 0; n < N_size; ++n) state[n] = h0_ptr[n];
+    } else {
+        for (int n = 0; n < N_size; ++n) state[n] = 0.0f;
+    }
 
     const scalar_t* u_ptr = u + (b_idx * L_size * D_size) + d_idx;
     const scalar_t* delta_ptr = delta + (b_idx * L_size * D_size) + d_idx;
@@ -66,6 +73,11 @@ __global__ void selective_scan_fwd_kernel(
         out_ptr += stride;
         state_save_ptr += stride * N_size; 
     }
+
+    if (ht != nullptr) {
+        scalar_t* ht_ptr = ht + (b_idx * D_size * N_size) + (d_idx * N_size);
+        for (int n = 0; n < N_size; ++n) ht_ptr[n] = state[n];
+    }
 }
 
 template <typename scalar_t>
@@ -76,6 +88,7 @@ __global__ void selective_scan_bwd_kernel(
     const scalar_t* __restrict__ B,
     const scalar_t* __restrict__ C,
     const scalar_t* __restrict__ D,
+    const scalar_t* __restrict__ h0,
     const scalar_t* __restrict__ x_state_save,
     const scalar_t* __restrict__ dout,
     
@@ -85,6 +98,7 @@ __global__ void selective_scan_bwd_kernel(
     scalar_t* __restrict__ dB,
     scalar_t* __restrict__ dC,
     scalar_t* __restrict__ dD,
+    scalar_t* __restrict__ dh0,
     
     const int B_size, const int L_size, const int D_size, const int N_size
 ) {
@@ -95,7 +109,7 @@ __global__ void selective_scan_bwd_kernel(
     int b_idx = idx / D_size;
     int d_idx = idx % D_size;
 
-    float dstate[16];
+    float dstate[64];
     for (int n = 0; n < N_size; ++n) dstate[n] = 0.0f;
     
     int offset = (b_idx * L_size * D_size) + d_idx;
@@ -137,7 +151,16 @@ __global__ void selective_scan_bwd_kernel(
             scalar_t C_val = C_t[n];
             
             scalar_t h_t = state_ptr[n]; 
-            scalar_t h_prev = (t > 0) ? (state_ptr - D_size * N_size)[n] : 0.0f;
+            scalar_t h_prev;
+            if (t > 0) {
+                 h_prev = (state_ptr - D_size * N_size)[n];
+            } else {
+                 if (h0 != nullptr) {
+                     h_prev = h0[(b_idx * D_size * N_size) + (d_idx * N_size) + n];
+                 } else {
+                     h_prev = 0.0f;
+                 }
+            }
 
             dstate[n] += dy * C_val;
             atomicAdd(dC_t + n, dy * h_t); 
@@ -167,25 +190,30 @@ __global__ void selective_scan_bwd_kernel(
         ddelta_ptr -= D_size;
         state_ptr -= D_size * N_size;
     }
+
+    if (dh0 != nullptr) {
+        scalar_t* dh0_ptr = dh0 + (b_idx * D_size * N_size) + (d_idx * N_size);
+        for (int n = 0; n < N_size; ++n) dh0_ptr[n] = dstate[n];
+    }
 }
 
 void launch_fwd(
-    const float* u, const float* delta, const float* A, const float* B, const float* C, const float* D,
-    float* out, float* x_save,
+    const float* u, const float* delta, const float* A, const float* B, const float* C, const float* D, const float* h0,
+    float* out, float* x_save, float* ht,
     int B_sz, int L, int Dim, int N, cudaStream_t stream
 ) {
     const int threads = 128;
     const int blocks = (B_sz * Dim + threads - 1) / threads;
-    selective_scan_fwd_kernel<float><<<blocks, threads, 0, stream>>>(u, delta, A, B, C, D, out, x_save, B_sz, L, Dim, N);
+    selective_scan_fwd_kernel<float><<<blocks, threads, 0, stream>>>(u, delta, A, B, C, D, h0, out, x_save, ht, B_sz, L, Dim, N);
 }
 
 void launch_bwd(
-    const float* u, const float* delta, const float* A, const float* B, const float* C, const float* D,
+    const float* u, const float* delta, const float* A, const float* B, const float* C, const float* D, const float* h0,
     const float* x_save, const float* dout,
-    float* du, float* ddelta, float* dA, float* dB, float* dC, float* dD,
+    float* du, float* ddelta, float* dA, float* dB, float* dC, float* dD, float* dh0,
     int B_sz, int L, int Dim, int N, cudaStream_t stream
 ) {
     const int threads = 128;
     const int blocks = (B_sz * Dim + threads - 1) / threads;
-    selective_scan_bwd_kernel<float><<<blocks, threads, 0, stream>>>(u, delta, A, B, C, D, x_save, dout, du, ddelta, dA, dB, dC, dD, B_sz, L, Dim, N);
+    selective_scan_bwd_kernel<float><<<blocks, threads, 0, stream>>>(u, delta, A, B, C, D, h0, x_save, dout, du, ddelta, dA, dB, dC, dD, dh0, B_sz, L, Dim, N);
 }
