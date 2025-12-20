@@ -132,6 +132,8 @@ __global__ void selective_scan_bwd_kernel(
     int B_stride = L_size * N_size;
     int C_stride = L_size * N_size;
 
+    scalar_t dD_accum = 0;
+
     for (int t = L_size - 1; t >= 0; --t) {
         scalar_t u_val = *u_ptr;
         scalar_t dt = *delta_ptr;
@@ -140,7 +142,7 @@ __global__ void selective_scan_bwd_kernel(
         scalar_t du_val = dy * D_val;
         scalar_t ddelta_val = 0.0f;
         
-        atomicAdd(dD_ptr, dy * u_val);
+        dD_accum += dy * u_val;
 
         const scalar_t* B_t = B + (b_idx * B_stride) + (t * N_size);
         const scalar_t* C_t = C + (b_idx * C_stride) + (t * N_size);
@@ -194,6 +196,8 @@ __global__ void selective_scan_bwd_kernel(
         ddelta_ptr -= D_size;
         state_ptr -= D_size * N_size;
     }
+    
+    atomicAdd(dD_ptr, dD_accum);
 }
 
 void launch_fwd(

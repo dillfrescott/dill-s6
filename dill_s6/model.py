@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 try:
     from . import mamba_cuda_core as mamba_cuda
@@ -78,6 +79,18 @@ class S6(nn.Module):
         self.dt_rank = max(1, self.d_model // 16)
         self.x_proj = nn.Linear(self.d_inner, (self.d_state * 2) + self.dt_rank, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        dt_min = 0.001
+        dt_max = 0.1
+        dt_init_floor = 1e-4
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        nn.init.kaiming_uniform_(self.dt_proj.weight, a=math.sqrt(5))
 
         A = torch.repeat_interleave(
             torch.arange(1, self.d_state + 1, dtype=torch.float32).unsqueeze(0),
