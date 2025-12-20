@@ -23,14 +23,6 @@ __global__ void selective_scan_fwd_kernel(
     int b_idx = idx / D_size;
     int d_idx = idx % D_size;
 
-    float state[64]; 
-    if (h0 != nullptr) {
-        const scalar_t* h0_ptr = h0 + (b_idx * D_size * N_size) + (d_idx * N_size);
-        for (int n = 0; n < N_size; ++n) state[n] = h0_ptr[n];
-    } else {
-        for (int n = 0; n < N_size; ++n) state[n] = 0.0f;
-    }
-
     const scalar_t* u_ptr = u + (b_idx * L_size * D_size) + d_idx;
     const scalar_t* delta_ptr = delta + (b_idx * L_size * D_size) + d_idx;
     scalar_t* out_ptr = out + (b_idx * L_size * D_size) + d_idx;
@@ -60,10 +52,21 @@ __global__ void selective_scan_fwd_kernel(
             scalar_t dA = exp(dt * A_val);
             scalar_t dB = dt * B_val;
 
-            state[n] = state[n] * dA + dB * u_val;
-            state_save_ptr[n] = state[n];
+            scalar_t prev_s;
+            if (t == 0) {
+                if (h0 != nullptr) {
+                    prev_s = h0[(b_idx * D_size * N_size) + (d_idx * N_size) + n];
+                } else {
+                    prev_s = 0.0f;
+                }
+            } else {
+                prev_s = (state_save_ptr - stride * N_size)[n];
+            }
 
-            y_val += state[n] * C_val;
+            scalar_t s = prev_s * dA + dB * u_val;
+            state_save_ptr[n] = s;
+
+            y_val += s * C_val;
         }
         
         *out_ptr = y_val + D_val * u_val;
@@ -76,7 +79,7 @@ __global__ void selective_scan_fwd_kernel(
 
     if (ht != nullptr) {
         scalar_t* ht_ptr = ht + (b_idx * D_size * N_size) + (d_idx * N_size);
-        for (int n = 0; n < N_size; ++n) ht_ptr[n] = state[n];
+        for (int n = 0; n < N_size; ++n) ht_ptr[n] = (state_save_ptr - stride * N_size)[n];
     }
 }
 
@@ -109,8 +112,8 @@ __global__ void selective_scan_bwd_kernel(
     int b_idx = idx / D_size;
     int d_idx = idx % D_size;
 
-    float dstate[64];
-    for (int n = 0; n < N_size; ++n) dstate[n] = 0.0f;
+    scalar_t* dstate_ptr = dh0 + (b_idx * D_size * N_size) + (d_idx * N_size);
+    for (int n = 0; n < N_size; ++n) dstate_ptr[n] = 0.0f;
     
     int offset = (b_idx * L_size * D_size) + d_idx;
     const scalar_t* u_ptr = u + offset + (L_size - 1) * D_size;
@@ -162,22 +165,23 @@ __global__ void selective_scan_bwd_kernel(
                  }
             }
 
-            dstate[n] += dy * C_val;
+            scalar_t ds = dstate_ptr[n];
+            ds += dy * C_val;
             atomicAdd(dC_t + n, dy * h_t); 
             
             scalar_t dA_exp = exp(dt * A_val);
-            scalar_t d_h_prev = dstate[n] * dA_exp;
-            du_val += dstate[n] * dt * B_val;
-            atomicAdd(dB_t + n, dstate[n] * u_val * dt); 
+            scalar_t d_h_prev = ds * dA_exp;
+            du_val += ds * dt * B_val;
+            atomicAdd(dB_t + n, ds * u_val * dt); 
             
-            scalar_t ddt_1 = dstate[n] * h_prev * dA_exp * A_val;
-            scalar_t ddt_2 = dstate[n] * u_val * B_val;
+            scalar_t ddt_1 = ds * h_prev * dA_exp * A_val;
+            scalar_t ddt_2 = ds * u_val * B_val;
             ddelta_val += ddt_1 + ddt_2;
             
-            scalar_t d_A_val = dstate[n] * h_prev * dA_exp * dt;
+            scalar_t d_A_val = ds * h_prev * dA_exp * dt;
             atomicAdd(dA_ptr + n, d_A_val);
 
-            dstate[n] = d_h_prev;
+            dstate_ptr[n] = d_h_prev;
         }
         
         *du_ptr = du_val;
@@ -189,11 +193,6 @@ __global__ void selective_scan_bwd_kernel(
         du_ptr -= D_size;
         ddelta_ptr -= D_size;
         state_ptr -= D_size * N_size;
-    }
-
-    if (dh0 != nullptr) {
-        scalar_t* dh0_ptr = dh0 + (b_idx * D_size * N_size) + (d_idx * N_size);
-        for (int n = 0; n < N_size; ++n) dh0_ptr[n] = dstate[n];
     }
 }
 

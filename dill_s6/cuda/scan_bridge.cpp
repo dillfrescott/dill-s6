@@ -18,7 +18,6 @@ void launch_bwd(
 
 std::vector<torch::Tensor> fwd(torch::Tensor u, torch::Tensor delta, torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor D, c10::optional<torch::Tensor> h0) {
     auto B_sz = u.size(0); auto L = u.size(1); auto Dim = u.size(2); auto N = A.size(1);
-    TORCH_CHECK(N <= 64, "d_state must be <= 64");
     auto out = torch::zeros_like(u);
     auto x_save = torch::zeros({(int)B_sz, (int)L, (int)Dim, (int)N}, u.options());
     
@@ -62,14 +61,12 @@ std::vector<torch::Tensor> bwd(
     auto dD = torch::zeros_like(D);
     
     const float* h0_ptr = nullptr;
-    float* dh0_ptr = nullptr;
-    torch::Tensor dh0;
-    
     if (h0.has_value() && h0->defined()) {
         h0_ptr = h0->data_ptr<float>();
-        dh0 = torch::zeros_like(*h0);
-        dh0_ptr = dh0.data_ptr<float>();
     }
+    
+    auto dh0 = torch::zeros({(int)B_sz, (int)Dim, (int)N}, u.options());
+    float* dh0_ptr = dh0.data_ptr<float>();
 
     launch_bwd(
         u.data_ptr<float>(), delta.data_ptr<float>(), A.data_ptr<float>(),
