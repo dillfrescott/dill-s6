@@ -20,18 +20,10 @@
 Since this package contains C++/CUDA extensions, it must be compiled during installation. Ensure you have the prerequisites installed, then run:
 
 ```bash
-pip install .
+pip install git+https://github.com/dillfrescott/dill-s6 --no-build-isolation
 ```
 
 *Note: This process may take a few minutes as it compiles the CUDA kernels.*
-
-### Development Installation
-
-For development, you can install in editable mode:
-
-```bash
-pip install -v -e .
-```
 
 ## Usage
 
