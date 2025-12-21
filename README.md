@@ -42,7 +42,8 @@ d_model = 64
 # d_state: State expansion factor (default 16)
 # d_conv: Local convolution kernel size (default 4)
 # expand: Block expansion factor (default 2)
-model = S6(d_model=d_model, d_state=16, d_conv=4, expand=2).cuda()
+# depth: Number of S6 layers (default 1)
+model = S6(d_model=d_model, d_state=16, d_conv=4, expand=2, depth=1).cuda()
 
 # Input tensor: (Batch, Length, Dimension)
 x = torch.randn(batch_size, seq_len, d_model).cuda()
@@ -53,6 +54,8 @@ output = model(x)
 print(f"Input shape: {x.shape}")
 print(f"Output shape: {output.shape}")
 ```
+
+The `depth` parameter controls the number of S6 layers stacked together. Each layer contains the same components (normalization, projections, convolutions, etc.) and processes the input sequentially. A higher depth creates a deeper network with more processing stages, potentially improving model capacity and performance for complex tasks.
 
 ## Troubleshooting
 
