@@ -43,7 +43,8 @@ d_model = 64
 # d_conv: Local convolution kernel size (default 4)
 # expand: Block expansion factor (default 2)
 # depth: Number of S6 layers (default 1)
-model = S6(d_model=d_model, d_state=16, d_conv=4, expand=2, depth=1).cuda()
+# bidirectional: Whether to process sequence in both directions (default False)
+model = S6(d_model=d_model, d_state=16, d_conv=4, expand=2, depth=1, bidirectional=True).cuda()
 
 # Input tensor: (Batch, Length, Dimension)
 x = torch.randn(batch_size, seq_len, d_model).cuda()

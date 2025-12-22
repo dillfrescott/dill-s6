@@ -75,7 +75,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 class S6(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto", dt_min=0.001, dt_max=0.1, dt_init="random", dt_scale=1.0, dt_proj_bias=True, dt_soft_plus=True, conv_bias=True, bias=False, use_fast_path=True, depth=1):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto", dt_min=0.001, dt_max=0.1, dt_init="random", dt_scale=1.0, dt_proj_bias=True, dt_soft_plus=True, conv_bias=True, bias=False, use_fast_path=True, depth=1, bidirectional=False):
         super().__init__()
         self.d_model = d_model
         self.d_inner = int(expand * d_model)
@@ -83,6 +83,7 @@ class S6(nn.Module):
         self.d_conv = d_conv
         self.depth = depth
         self.use_fast_path = use_fast_path
+        self.bidirectional = bidirectional
         self.layers = nn.ModuleList()
         for _ in range(depth):
             in_proj = nn.Linear(d_model, self.d_inner * 2, bias=bias)
@@ -134,6 +135,15 @@ class S6(nn.Module):
             C_ssm = C_ssm.view(B, L, 1, self.d_state).expand(B, L, self.d_inner, self.d_state)
             A = -torch.exp(layer.A_log).to(x_conv.dtype)
             y = selective_scan_fn(x_conv, dt, A, B_ssm, C_ssm, layer.D)
+
+            if self.bidirectional:
+                x_conv_bwd = x_conv.flip([1])
+                dt_bwd = dt.flip([1])
+                B_ssm_bwd = B_ssm.flip([1])
+                C_ssm_bwd = C_ssm.flip([1])
+                y_bwd = selective_scan_fn(x_conv_bwd, dt_bwd, A, B_ssm_bwd, C_ssm_bwd, layer.D)
+                y = y + y_bwd.flip([1])
+
             y = y * layer["act"](z_branch)
             out = layer["out_proj"](y) + residual
         return self.norm_f(out)
