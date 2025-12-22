@@ -13,7 +13,10 @@
 - **OS**: Linux or Windows (with CUDA environment set up).
 - **Python**: 3.7+
 - **PyTorch**: >= 1.10 (with CUDA support).
-- **CUDA Toolkit**: `nvcc` compiler must be available in your system path.
+- **CUDA Toolkit**: Version matching your PyTorch installation (e.g., 11.8, 12.1). The `nvcc` compiler must be available in your system path.
+- **C++ Build Tools**:
+    - **Windows**: [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload installed.
+    - **Linux**: GCC/G++ (typically `build-essential`).
 
 ## Installation
 
