@@ -31,12 +31,38 @@ __device__ __forceinline__ void my_atomic_add(__half* address, __half val) {
 #if __CUDA_ARCH__ >= 700
     atomicAdd(address, val);
 #else
-    atomicAdd(address, val); 
+    // Pre-Volta: convert to float, atomic add, convert back (software fallback)
+    unsigned int* address_as_ui = reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned long long>(address) & ~0x3UL);
+    unsigned int old = *address_as_ui;
+    unsigned int assumed;
+    __half2 old_val = *reinterpret_cast<__half2*>(&old);
+    __half new_val;
+    if (reinterpret_cast<unsigned long long>(address) & 0x2) {
+        new_val = __float2half(__half2float(old_val.y) + __half2float(val));
+        old_val.y = new_val;
+    } else {
+        new_val = __float2half(__half2float(old_val.x) + __half2float(val));
+        old_val.x = new_val;
+    }
+    __half2 new_val2 = old_val;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ui, assumed, *reinterpret_cast<unsigned int*>(&new_val2));
+        old_val = *reinterpret_cast<__half2*>(&old);
+        if (reinterpret_cast<unsigned long long>(address) & 0x2) {
+            new_val = __float2half(__half2float(old_val.y) + __half2float(val));
+            old_val.y = new_val;
+        } else {
+            new_val = __float2half(__half2float(old_val.x) + __half2float(val));
+            old_val.x = new_val;
+        }
+        new_val2 = old_val;
+    } while (assumed != old);
 #endif
 }
 
 template <typename scalar_t>
-__global__ void selective_scan_fwd_kernel(
+__global__ __launch_bounds__(128, 4) void selective_scan_fwd_kernel(
     const scalar_t* __restrict__ u,
     const scalar_t* __restrict__ delta,
     const scalar_t* __restrict__ A,
@@ -45,7 +71,7 @@ __global__ void selective_scan_fwd_kernel(
     const scalar_t* __restrict__ D,
     const scalar_t* __restrict__ h0,
     scalar_t* __restrict__ out,
-    scalar_t* __restrict__ x_state_save, 
+    scalar_t* __restrict__ x_state_save,
     scalar_t* __restrict__ ht,
     const int B_size, const int L_size, const int D_size, const int N_size
 ) {
@@ -62,25 +88,26 @@ __global__ void selective_scan_fwd_kernel(
     scalar_t* state_save_ptr = x_state_save + (b_idx * L_size * D_size * N_size) + (d_idx * N_size);
 
     const scalar_t* A_ptr = A + (d_idx * N_size);
-    scalar_t D_val = D[d_idx];
+    scalar_t D_val = __ldg(D + d_idx);
 
     int stride = D_size;
     int B_stride = L_size * N_size;
     int C_stride = L_size * N_size;
 
     for (int t = 0; t < L_size; ++t) {
-        scalar_t u_val = *u_ptr;
-        scalar_t dt = *delta_ptr;
+        scalar_t u_val = __ldg(u_ptr);
+        scalar_t dt = __ldg(delta_ptr);
 
         const scalar_t* B_t = B + (b_idx * B_stride) + (t * N_size);
         const scalar_t* C_t = C + (b_idx * C_stride) + (t * N_size);
 
-        scalar_t y_val = static_cast<scalar_t>(0.0f); 
+        scalar_t y_val = static_cast<scalar_t>(0.0f);
 
+        #pragma unroll
         for (int n = 0; n < N_size; ++n) {
-            scalar_t A_val = A_ptr[n];
-            scalar_t B_val = B_t[n];
-            scalar_t C_val = C_t[n];
+            scalar_t A_val = __ldg(A_ptr + n);
+            scalar_t B_val = __ldg(B_t + n);
+            scalar_t C_val = __ldg(C_t + n);
 
             scalar_t dA = my_exp(dt * A_val);
             scalar_t dB = dt * B_val;
@@ -88,7 +115,7 @@ __global__ void selective_scan_fwd_kernel(
             scalar_t prev_s;
             if (t == 0) {
                 if (h0 != nullptr) {
-                    prev_s = h0[(b_idx * D_size * N_size) + (d_idx * N_size) + n];
+                    prev_s = __ldg(h0 + (b_idx * D_size * N_size) + (d_idx * N_size) + n);
                 } else {
                     prev_s = static_cast<scalar_t>(0.0f);
                 }
@@ -112,12 +139,14 @@ __global__ void selective_scan_fwd_kernel(
 
     if (ht != nullptr) {
         scalar_t* ht_ptr = ht + (b_idx * D_size * N_size) + (d_idx * N_size);
-        for (int n = 0; n < N_size; ++n) ht_ptr[n] = (state_save_ptr - stride * N_size)[n];
+        const scalar_t* src_ptr = state_save_ptr - stride * N_size;
+        #pragma unroll
+        for (int n = 0; n < N_size; ++n) ht_ptr[n] = src_ptr[n];
     }
 }
 
 template <typename scalar_t>
-__global__ void selective_scan_bwd_kernel(
+__global__ __launch_bounds__(128, 4) void selective_scan_bwd_kernel(
     const scalar_t* __restrict__ u,
     const scalar_t* __restrict__ delta,
     const scalar_t* __restrict__ A,
@@ -127,7 +156,7 @@ __global__ void selective_scan_bwd_kernel(
     const scalar_t* __restrict__ h0,
     const scalar_t* __restrict__ x_save,
     const scalar_t* __restrict__ dout,
-    
+
     scalar_t* __restrict__ du,
     scalar_t* __restrict__ ddelta,
     scalar_t* __restrict__ dA,
@@ -135,7 +164,7 @@ __global__ void selective_scan_bwd_kernel(
     scalar_t* __restrict__ dC,
     scalar_t* __restrict__ dD,
     scalar_t* __restrict__ dh0,
-    
+
     const int B_size, const int L_size, const int D_size, const int N_size
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -159,7 +188,7 @@ __global__ void selective_scan_bwd_kernel(
 
     const scalar_t* A_ptr = A + (d_idx * N_size);
     scalar_t* dA_ptr = dA + (d_idx * N_size);
-    scalar_t D_val = D[d_idx];
+    scalar_t D_val = __ldg(D + d_idx);
     scalar_t* dD_ptr = dD + d_idx;
 
     int B_stride = L_size * N_size;
@@ -168,9 +197,9 @@ __global__ void selective_scan_bwd_kernel(
     scalar_t dD_accum = static_cast<scalar_t>(0.0f);
 
     for (int t = L_size - 1; t >= 0; --t) {
-        scalar_t u_val = *u_ptr;
-        scalar_t dt = *delta_ptr;
-        scalar_t dy = *dout_ptr;
+        scalar_t u_val = __ldg(u_ptr);
+        scalar_t dt = __ldg(delta_ptr);
+        scalar_t dy = __ldg(dout_ptr);
         
         scalar_t du_val = dy * D_val;
         scalar_t ddelta_val = static_cast<scalar_t>(0.0f);
@@ -183,18 +212,19 @@ __global__ void selective_scan_bwd_kernel(
         scalar_t* dB_t = dB + (b_idx * B_stride) + (t * N_size);
         scalar_t* dC_t = dC + (b_idx * C_stride) + (t * N_size);
 
+        #pragma unroll
         for (int n = 0; n < N_size; ++n) {
-            scalar_t A_val = A_ptr[n];
-            scalar_t B_val = B_t[n];
-            scalar_t C_val = C_t[n];
+            scalar_t A_val = __ldg(A_ptr + n);
+            scalar_t B_val = __ldg(B_t + n);
+            scalar_t C_val = __ldg(C_t + n);
             
-            scalar_t h_t = state_ptr[n]; 
+            scalar_t h_t = __ldg(state_ptr + n);
             scalar_t h_prev;
             if (t > 0) {
-                 h_prev = (state_ptr - D_size * N_size)[n];
+                 h_prev = __ldg(state_ptr - D_size * N_size + n);
             } else {
                  if (h0 != nullptr) {
-                     h_prev = h0[(b_idx * D_size * N_size) + (d_idx * N_size) + n];
+                     h_prev = __ldg(h0 + (b_idx * D_size * N_size) + (d_idx * N_size) + n);
                  } else {
                      h_prev = static_cast<scalar_t>(0.0f);
                  }

@@ -12,9 +12,9 @@ class SelectiveScanFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D, initial_state=None):
         if mamba_cuda is not None:
-            u, delta, A, B, C, D = [x.contiguous() for x in (u, delta, A, B, C, D)]
+            u, delta, A, B, C, D = [x if x.is_contiguous() else x.contiguous() for x in (u, delta, A, B, C, D)]
             if initial_state is not None:
-                initial_state = initial_state.contiguous()
+                initial_state = initial_state if initial_state.is_contiguous() else initial_state.contiguous()
             out, x_save, *rest = mamba_cuda.fwd(u, delta, A, B, C, D, initial_state)
             ctx.save_for_backward(u, delta, A, B, C, D, initial_state, x_save)
             ctx.has_initial_state = initial_state is not None
@@ -27,7 +27,7 @@ class SelectiveScanFn(torch.autograd.Function):
     def backward(ctx, dout, *args):
         if mamba_cuda is not None:
             u, delta, A, B, C, D, initial_state, x_save = ctx.saved_tensors
-            dout = dout.contiguous()
+            dout = dout if dout.is_contiguous() else dout.contiguous()
             grads = mamba_cuda.bwd(u, delta, A, B, C, D, initial_state, x_save, dout)
             du, ddelta, dA, dB, dC, dD = grads[:6]
             dh0 = grads[6] if ctx.has_initial_state else None
@@ -75,14 +75,13 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 class S6(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto", dt_min=0.001, dt_max=0.1, dt_init="random", dt_scale=1.0, dt_proj_bias=True, dt_soft_plus=True, conv_bias=True, bias=False, use_fast_path=True, depth=1, bidirectional=False):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto", dt_min=0.001, dt_max=0.1, dt_init="random", dt_scale=1.0, dt_proj_bias=True, dt_soft_plus=True, conv_bias=True, bias=False, depth=1, bidirectional=False):
         super().__init__()
         self.d_model = d_model
         self.d_inner = int(expand * d_model)
         self.d_state = d_state
         self.d_conv = d_conv
         self.depth = depth
-        self.use_fast_path = use_fast_path
         self.bidirectional = bidirectional
         self.layers = nn.ModuleList()
         for _ in range(depth):
@@ -101,18 +100,22 @@ class S6(nn.Module):
             dt = torch.exp(torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)).clamp(min=1e-4)
             with torch.no_grad():
                 dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))
-            A = torch.arange(1, d_state + 1).float().repeat(self.d_inner, 1)
-            layer = nn.ModuleDict({
-                "norm": RMSNorm(d_model),
-                "in_proj": in_proj,
-                "conv1d": conv1d,
-                "x_proj": x_proj,
-                "dt_proj": dt_proj,
-                "act": nn.SiLU(),
-                "out_proj": nn.Linear(self.d_inner, d_model, bias=bias),
-            })
-            layer.register_parameter("A_log", nn.Parameter(torch.log(A)))
-            layer.register_parameter("D", nn.Parameter(torch.ones(self.d_inner)))
+            A = torch.arange(1, d_state + 1, dtype=torch.float32, device=in_proj.weight.device).repeat(self.d_inner, 1)
+            A_log = nn.Parameter(torch.log(A))
+            with torch.no_grad():
+                A_negexp = -torch.exp(A_log)
+
+            layer = nn.Module()
+            layer.norm = RMSNorm(d_model)
+            layer.in_proj = in_proj
+            layer.conv1d = conv1d
+            layer.x_proj = x_proj
+            layer.dt_proj = dt_proj
+            layer.act = nn.SiLU()
+            layer.out_proj = nn.Linear(self.d_inner, d_model, bias=bias)
+            layer.register_parameter("A_log", A_log)
+            layer.register_buffer("A_negexp", A_negexp)
+            layer.register_parameter("D", nn.Parameter(torch.ones(self.d_inner, device=in_proj.weight.device)))
             layer.dt_rank = rank
             self.layers.append(layer)
         self.norm_f = RMSNorm(d_model)
@@ -121,19 +124,19 @@ class S6(nn.Module):
         out = x
         for layer in self.layers:
             residual = out
-            out = layer["norm"](out)
+            out = layer.norm(out)
             B, L, _ = out.shape
-            xz = layer["in_proj"](out)
+            xz = layer.in_proj(out)
             x_branch, z_branch = xz.chunk(2, dim=-1)
-            x_conv = layer["conv1d"](x_branch.transpose(1, 2))[..., :L]
-            x_conv = layer["act"](x_conv.transpose(1, 2))
-            x_dbl = layer["x_proj"](x_conv)
+            x_conv = layer.conv1d(x_branch.transpose(1, 2))[..., :L]
+            x_conv = layer.act(x_conv.transpose(1, 2))
+            x_dbl = layer.x_proj(x_conv)
             dt_rank = layer.dt_rank
             dt, B_ssm, C_ssm = torch.split(x_dbl, [dt_rank, self.d_state, self.d_state], dim=-1)
-            dt = F.softplus(layer["dt_proj"](dt))
+            dt = F.softplus(layer.dt_proj(dt))
             B_ssm = B_ssm.view(B, L, 1, self.d_state).expand(B, L, self.d_inner, self.d_state)
             C_ssm = C_ssm.view(B, L, 1, self.d_state).expand(B, L, self.d_inner, self.d_state)
-            A = -torch.exp(layer.A_log).to(x_conv.dtype)
+            A = layer.A_negexp.to(x_conv.dtype)
             y = selective_scan_fn(x_conv, dt, A, B_ssm, C_ssm, layer.D)
 
             if self.bidirectional:
@@ -144,6 +147,6 @@ class S6(nn.Module):
                 y_bwd = selective_scan_fn(x_conv_bwd, dt_bwd, A, B_ssm_bwd, C_ssm_bwd, layer.D)
                 y = y + y_bwd.flip([1])
 
-            y = y * layer["act"](z_branch)
-            out = layer["out_proj"](y) + residual
+            y = y * layer.act(z_branch)
+            out = layer.out_proj(y) + residual
         return self.norm_f(out)
