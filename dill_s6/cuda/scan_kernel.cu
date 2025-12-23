@@ -31,7 +31,6 @@ __device__ __forceinline__ void my_atomic_add(__half* address, __half val) {
 #if __CUDA_ARCH__ >= 700
     atomicAdd(address, val);
 #else
-    // Pre-Volta: convert to float, atomic add, convert back (software fallback)
     unsigned int* address_as_ui = reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned long long>(address) & ~0x3UL);
     unsigned int old = *address_as_ui;
     unsigned int assumed;
